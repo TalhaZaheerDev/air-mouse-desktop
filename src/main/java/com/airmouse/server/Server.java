@@ -1,104 +1,95 @@
 package com.airmouse.server;
 
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketException;
-import java.util.Enumeration;
 
 /**
  * TCP server that listens on port 5000.
  * Accepts one client at a time, handles it, then waits for the next.
+ * Runs the accept loop on a background thread so the UI is not blocked.
  */
 public class Server {
 
     private static final int PORT = 5000;
 
     private final MouseController mouseController;
+    private ServerListener listener;
+    private ServerSocket serverSocket;
+    private volatile boolean running = false;
 
     public Server(MouseController mouseController) {
         this.mouseController = mouseController;
     }
 
+    public void setListener(ServerListener listener) {
+        this.listener = listener;
+    }
+
     /**
-     * Starts the server loop. Blocks indefinitely.
+     * Starts the server loop in a new background thread.
      */
-    public void start() throws IOException {
-        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-            printBanner();
+    public void startAsync() {
+        if (running) return;
+        running = true;
 
-            while (true) {
-                System.out.println("Waiting for connection...");
+        Thread serverThread = new Thread(this::runServerLoop, "AirMouse-Server-Thread");
+        serverThread.setDaemon(true);
+        serverThread.start();
+    }
+
+    private void runServerLoop() {
+        try {
+            serverSocket = new ServerSocket(PORT);
+            
+            NetworkUtils.NetworkInfo netInfo = NetworkUtils.detect();
+            if (listener != null) {
+                listener.onServerStarted(netInfo.ipAddress, PORT);
+            }
+
+            if (listener != null) {
+                listener.onServerStarted(netInfo.ipAddress, PORT);
+                listener.onLogMessage("Server Started on " + netInfo.ipAddress + ":" + PORT);
+            }
+
+            while (running && !serverSocket.isClosed()) {
+                if (listener != null) listener.onLogMessage("Waiting for connection...");
                 Socket clientSocket = serverSocket.accept();
-                System.out.println("Connected");
+                
+                String clientAddress = clientSocket.getInetAddress().getHostAddress();
+                if (listener != null) listener.onLogMessage("Connected: " + clientAddress);
 
-                ClientHandler handler = new ClientHandler(clientSocket, mouseController);
+                if (listener != null) {
+                    listener.onClientConnected(clientAddress);
+                }
+
+                ClientHandler handler = new ClientHandler(clientSocket, mouseController, listener);
                 handler.handle();
 
                 // After client disconnects, loop back and wait for next client
             }
-        }
-    }
-
-    /**
-     * Prints the startup banner with detected local IPv4 address and port.
-     */
-    private void printBanner() {
-        String localIp = detectLocalIpv4();
-
-        System.out.println();
-        System.out.println("=================================");
-        System.out.println("   AirMouse Server Started");
-        System.out.println("=================================");
-        System.out.println();
-        System.out.println("Local IP : " + localIp);
-        System.out.println("Port     : " + PORT);
-        System.out.println();
-        System.out.println("Enter these values into the Flutter app.");
-        System.out.println();
-    }
-
-    /**
-     * Detects the local IPv4 address from a real network adapter (Wi-Fi/Ethernet),
-     * ignoring loopback, link-local, and virtual adapters (VMware, Hyper-V, Docker, etc.).
-     */
-    private String detectLocalIpv4() {
-        try {
-            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-            while (interfaces.hasMoreElements()) {
-                NetworkInterface ni = interfaces.nextElement();
-
-                // Skip down, loopback, or virtual adapters
-                if (!ni.isUp() || ni.isLoopback() || ni.isVirtual()) {
-                    continue;
-                }
-
-                // Skip known virtual adapter names
-                String name = ni.getDisplayName().toLowerCase();
-                if (name.contains("vmware") || name.contains("virtualbox")
-                        || name.contains("hyper-v") || name.contains("docker")
-                        || name.contains("vethernet") || name.contains("loopback")) {
-                    continue;
-                }
-
-                Enumeration<InetAddress> addresses = ni.getInetAddresses();
-                while (addresses.hasMoreElements()) {
-                    InetAddress addr = addresses.nextElement();
-
-                    // Only IPv4, skip loopback and link-local (169.254.x.x)
-                    if (addr instanceof java.net.Inet4Address
-                            && !addr.isLoopbackAddress()
-                            && !addr.isLinkLocalAddress()) {
-                        return addr.getHostAddress();
-                    }
-                }
+        } catch (IOException e) {
+            if (running) {
+                if (listener != null) listener.onLogMessage("Server error: " + e.getMessage());
             }
-        } catch (SocketException e) {
-            System.out.println("Warning: Could not detect local IP (" + e.getMessage() + ")");
+        } finally {
+            stop();
         }
+    }
 
-        return "Unknown (check ipconfig manually)";
+    public void restartAsync() {
+        stop();
+        startAsync();
+    }
+
+    public void stop() {
+        running = false;
+        if (serverSocket != null && !serverSocket.isClosed()) {
+            try {
+                serverSocket.close();
+            } catch (IOException e) {
+                // ignore
+            }
+        }
     }
 }
